@@ -1,0 +1,569 @@
+name: Vulnerability watch
+
+on:
+  workflow_call:
+    inputs:
+      watch_keywords:
+        description: Components matched against new CVEs (NVD) and CISA KEV, separated by ;
+        type: string
+        required: true
+      kev_extra_keywords:
+        description: Components matched only against CISA KEV, separated by ;
+        type: string
+        default: 'Linux Kernel;Docker;runc;containerd;OpenSSH;glibc;GitHub'
+      maven_skip_groups:
+        description: Maven groupIds that cannot be resolved in CI (local-only artifacts), separated by ,
+        type: string
+        default: ''
+      lookback_hours:
+        type: string
+        default: '26'
+      min_cvss:
+        type: string
+        default: '7.0'
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_IMAGE: 'aquasec/trivy:0.76.2'
+  PYTHON_IMAGE: 'python:3.14.10-alpine'
+  MAVEN_IMAGE: 'maven:3.9.12-eclipse-temurin-25-alpine'
+  NODE_IMAGE: 'node:24.11.0-alpine'
+  SEMGREP_IMAGE: 'semgrep/semgrep:1.186.0'
+  SEMGREP_RULES_REPO: 'https://github.com/semgrep/semgrep-rules.git'
+
+jobs:
+  watch:
+    name: Vulnerability watch
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Detect stack
+        id: detect
+        run: |
+          set -euo pipefail
+          tools="$HOME/.cache/vuln-watch"
+          reports="$RUNNER_TEMP/reports"
+          mkdir -p "$tools/trivy-cache" "$tools/m2" "$reports"
+          {
+            echo "TOOLS_DIR=$tools"
+            echo "REPORT_DIR=$reports"
+            echo "IGNORE_FILE=$RUNNER_TEMP/trivyignore.yaml"
+          } >> "$GITHUB_ENV"
+          if [ -f .trivyignore.yaml ]; then cp .trivyignore.yaml "$RUNNER_TEMP/trivyignore.yaml"; else echo 'vulnerabilities: []' > "$RUNNER_TEMP/trivyignore.yaml"; fi
+
+          cat > "$tools/trivy-report.sh" <<'SH'
+          #!/usr/bin/env bash
+          label="$1"
+          report="$2"
+          if [ ! -s "$report" ]; then
+            echo "::error::$label scan did not run"
+            exit 1
+          fi
+          awk -F'│' -v label="$label" '
+            function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+            NF < 8 { next }
+            trim($2) == "Library" { lib = ""; sev = ""; ver = ""; next }
+            {
+              if (trim($2) != "") { lib = trim($2) }
+              if (trim($4) != "") { sev = trim($4) }
+              if (trim($6) != "") { ver = trim($6) }
+            }
+            trim($3) ~ /^(CVE|GHSA)-/ {
+              id = trim($3)
+              found++
+              printf "::error title=%s %s::%s [%s] in %s %s (fixed: %s) - %s https://avd.aquasec.com/nvd/%s\n", label, id, id, sev, lib, ver, trim($7), trim($8), tolower(id)
+            }
+            END { if (!found) print label ": no HIGH/CRITICAL" }
+          ' "$report"
+          if grep -qE 'Total: [1-9]' "$report"; then
+            cat "$report"
+          fi
+          exit 0
+          SH
+          chmod +x "$tools/trivy-report.sh"
+
+          files=$(git ls-files)
+          has() { echo "$files" | grep -qE "$1" && echo true || echo false; }
+          dockerfiles=$(echo "$files" | grep -E '(^|/)Dockerfile[^/]*$' || true)
+          compose=$(echo "$files" | grep -E '(^|/)(docker-compose[^/]*|compose)\.ya?ml$' || true)
+          images=""
+          for f in $dockerfiles; do
+            stages=$(grep -iE '^\s*FROM\s' "$f" | grep -ioE '\sAS\s+\S+' | awk '{print tolower($2)}' || true)
+            for img in $(grep -iE '^\s*FROM\s' "$f" | sed -E 's/--platform=\S+//I' | awk '{print $2}'); do
+              lower=$(echo "$img" | tr 'A-Z' 'a-z')
+              if [ "$lower" = "scratch" ] || echo "$img" | grep -q '\$' || echo "$stages" | grep -qx "$lower"; then continue; fi
+              images="$images $img"
+            done
+          done
+          for f in $compose; do
+            images="$images $(grep -hE '^\s*image:' "$f" | awk '{print $2}' | tr -d "'\"" | grep -v '\$' | tr '\n' ' ')"
+          done
+          images=$(echo $images | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')
+          cdn=$(echo "$files" | grep -E '\.(html|vue|js|ts|mjs)$' | grep -v node_modules | xargs -r grep -lE 'https://(unpkg\.com|cdn\.jsdelivr\.net/npm)/' 2>/dev/null || true)
+          {
+            echo "maven=$( [ -f pom.xml ] && echo true || echo false )"
+            echo "npm=$( [ -f package.json ] && echo true || echo false )"
+            echo "jars=$(has '\.jar$')"
+            echo "java=$(has '\.java$')"
+            echo "js=$(has '\.(js|mjs|cjs|ts)$')"
+            echo "cdn=$( [ -n "$cdn" ] && echo true || echo false )"
+            echo "images=$images"
+            echo "date=$(date -u +%F)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/vuln-watch/trivy-cache
+          key: trivy-${{ steps.detect.outputs.date }}
+          restore-keys: trivy-
+
+      - uses: actions/cache@v6
+        if: steps.detect.outputs.maven == 'true'
+        with:
+          path: ~/.cache/vuln-watch/m2
+          key: m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: m2-
+
+      - name: Prepare tools
+        env:
+          NEEDS_MAVEN: ${{ steps.detect.outputs.maven }}
+          NEEDS_NODE: ${{ steps.detect.outputs.npm }}
+          NEEDS_JAVA: ${{ steps.detect.outputs.java }}
+          NEEDS_JS: ${{ steps.detect.outputs.js }}
+        run: |
+          set -euo pipefail
+          images="$TRIVY_IMAGE $PYTHON_IMAGE"
+          [ "$NEEDS_MAVEN" = true ] && images="$images $MAVEN_IMAGE"
+          [ "$NEEDS_NODE" = true ] && images="$images $NODE_IMAGE"
+          { [ "$NEEDS_JAVA" = true ] || [ "$NEEDS_JS" = true ]; } && images="$images $SEMGREP_IMAGE"
+          for img in $images; do docker pull -q "$img"; done
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$TOOLS_DIR/trivy-cache:/cache" "$TRIVY_IMAGE" \
+            image --cache-dir /cache --download-db-only --no-progress
+          if [ "$NEEDS_JAVA" = true ] || [ "$NEEDS_JS" = true ]; then
+            git clone -q --depth 1 "$SEMGREP_RULES_REPO" "$RUNNER_TEMP/semgrep-rules-all"
+            mkdir -p "$RUNNER_TEMP/semgrep-rules"
+            [ "$NEEDS_JAVA" = true ] && cp -r "$RUNNER_TEMP/semgrep-rules-all/java" "$RUNNER_TEMP/semgrep-rules/"
+            [ "$NEEDS_JS" = true ] && cp -r "$RUNNER_TEMP/semgrep-rules-all/javascript" "$RUNNER_TEMP/semgrep-rules-all/typescript" "$RUNNER_TEMP/semgrep-rules/"
+            find "$RUNNER_TEMP/semgrep-rules" -type f ! \( -name '*.yaml' -o -name '*.yml' \) -delete
+            find "$RUNNER_TEMP/semgrep-rules" -name '*.test.y*ml' -delete
+          fi
+
+      - name: 'New CVEs: NVD + CISA KEV'
+        if: ${{ !cancelled() }}
+        env:
+          WATCH_KEYWORDS: ${{ inputs.watch_keywords }}
+          KEV_EXTRA_KEYWORDS: ${{ inputs.kev_extra_keywords }}
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours }}
+          MIN_CVSS: ${{ inputs.min_cvss }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/advisories.py" <<'PY'
+          import json, os, re, sys, time, urllib.parse, urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          def split(name):
+              return [k.strip() for k in os.environ.get(name, "").split(";") if k.strip()]
+
+          keywords = split("WATCH_KEYWORDS")
+          kev_keywords = keywords + split("KEV_EXTRA_KEYWORDS")
+          min_cvss = float(os.environ["MIN_CVSS"])
+          now = datetime.now(timezone.utc)
+          since = now - timedelta(hours=int(os.environ["LOOKBACK_HOURS"]))
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "vuln-watch"})
+              for attempt in range(4):
+                  try:
+                      with urllib.request.urlopen(req, timeout=90) as resp:
+                          return json.load(resp)
+                  except Exception as ex:
+                      if attempt == 3:
+                          raise
+                      print(f"  retry {url[:80]}...: {ex}")
+                      time.sleep(15 * (attempt + 1))
+
+          def matching(text, words):
+              return [w for w in words if re.search(r"(?<![\w-])" + re.escape(w) + r"(?![\w-])", text, re.I)]
+
+          lead = re.compile(r"^\s*(?:Description:\s*)?(?:In\s+)?(?P<product>(?:[^.:\n]|\.(?=\S)){1,120}?)\s"
+                            r"(?:before|prior to|versions?|through|is an?|contains|allows|has)\b", re.I)
+
+          def other_product(description, word):
+              found = lead.match(description)
+              if re.search(r"WordPress (?:plugin|theme)", description, re.I):
+                  return True
+              return bool(found) and not matching(found.group("product"), [word])
+
+          def score(cve):
+              scores = []
+              for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30"):
+                  for metric in cve.get("metrics", {}).get(key, []):
+                      scores.append(metric["cvssData"]["baseScore"])
+              return max(scores) if scores else None
+
+          hits = {}
+
+          kev = fetch("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
+          for vuln in kev["vulnerabilities"]:
+              if vuln["dateAdded"] < since.date().isoformat():
+                  continue
+              text = " ".join([vuln["vendorProject"], vuln["product"], vuln["vulnerabilityName"], vuln.get("shortDescription", "")])
+              found = matching(text, kev_keywords)
+              if found:
+                  hits[vuln["cveID"]] = {"source": "CISA KEV (actively exploited)", "score": None,
+                                         "keywords": found, "summary": vuln["vulnerabilityName"]}
+
+          fmt = "%Y-%m-%dT%H:%M:%S.000"
+          for word in keywords:
+              query = urllib.parse.urlencode({"keywordSearch": word, "pubStartDate": since.strftime(fmt),
+                                              "pubEndDate": now.strftime(fmt)})
+              data = fetch("https://services.nvd.nist.gov/rest/json/cves/2.0?" + query + "&noRejected")
+              for item in data.get("vulnerabilities", []):
+                  cve = item["cve"]
+                  description = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "")
+                  found = matching(description, [word])
+                  cvss = score(cve)
+                  if not found or other_product(description, word) or (cvss is not None and cvss < min_cvss):
+                      continue
+                  entry = hits.setdefault(cve["id"], {"source": "NVD", "score": cvss, "keywords": [], "summary": description[:300]})
+                  entry["keywords"] = sorted(set(entry["keywords"] + found))
+              time.sleep(6.5)
+
+          with open("/reports/advisories.json", "w") as out:
+              json.dump(hits, out, indent=2, ensure_ascii=False)
+
+          print(f"Window: since {since.isoformat(timespec='minutes')} | KEV + NVD (CVSS >= {min_cvss} or unscored)")
+          if not hits:
+              print("No new CVEs for watched components.")
+              sys.exit(0)
+          for cve_id, hit in sorted(hits.items()):
+              label = f"{hit['score']}" if hit["score"] is not None else "unscored"
+              summary = " ".join(hit["summary"].split())
+              print(f"::error title={cve_id}::[{hit['source']}, {label}] {', '.join(hit['keywords'])}: {summary}")
+              print(f"    https://nvd.nist.gov/vuln/detail/{cve_id}")
+          sys.exit(1)
+          PY
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -e WATCH_KEYWORDS -e KEV_EXTRA_KEYWORDS -e LOOKBACK_HOURS -e MIN_CVSS \
+            -v "$RUNNER_TEMP/advisories.py:/advisories.py:ro" \
+            -v "$REPORT_DIR:/reports" \
+            "$PYTHON_IMAGE" python -I /advisories.py
+
+      - name: 'Maven dependencies: resolve'
+        if: ${{ !cancelled() && steps.detect.outputs.maven == 'true' }}
+        env:
+          SKIP_GROUPS: ${{ inputs.maven_skip_groups }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/deps"
+          docker run --rm --network none -u "$(id -u):$(id -g)" -e SKIP_GROUPS \
+            -v "$PWD/pom.xml:/in/pom.xml:ro" -v "$PWD:/out" \
+            "$PYTHON_IMAGE" python -I -c '
+          import os, re
+          pom = open("/in/pom.xml").read()
+          for group in filter(None, (g.strip() for g in os.environ.get("SKIP_GROUPS", "").split(","))):
+              pom = re.sub(r"<dependency>(?:(?!</dependency>).)*?<groupId>\s*" + re.escape(group) + r"\s*</groupId>.*?</dependency>", "", pom, flags=re.S)
+          open("/out/pom.vuln-watch.xml", "w").write(pom)
+          '
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e MAVEN_CONFIG=/tmp/.m2 \
+            -v "$PWD:/project" \
+            -v "$RUNNER_TEMP/deps:/deps" \
+            -v "$TOOLS_DIR/m2:/m2" \
+            -w /project \
+            "$MAVEN_IMAGE" \
+            mvn -B -q -f pom.vuln-watch.xml -Dmaven.repo.local=/m2 \
+              dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=/deps
+          rm -f pom.vuln-watch.xml
+          echo "Runtime JARs: $(ls "$RUNNER_TEMP/deps" | wc -l)"
+
+      - name: 'Maven dependencies: SBOM + Trivy'
+        if: ${{ !cancelled() && steps.detect.outputs.maven == 'true' }}
+        run: |
+          set -euo pipefail
+          trivy() {
+            docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
+              -v "$RUNNER_TEMP/deps:/deps:ro" -v "$TOOLS_DIR/trivy-cache:/cache:ro" \
+              -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
+              "$TRIVY_IMAGE" rootfs /deps --cache-dir /cache --skip-db-update --offline-scan --no-progress "$@"
+          }
+          trivy --quiet --format cyclonedx --output /reports/sbom-maven.cdx.json
+          rc=0
+          trivy --ignorefile /trivyignore.yaml --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --format table --output /reports/trivy-maven.txt || rc=$?
+          "$TOOLS_DIR/trivy-report.sh" Maven "$REPORT_DIR/trivy-maven.txt" || exit 1
+          exit $rc
+
+      - name: 'Committed JARs: SBOM + Trivy'
+        if: ${{ !cancelled() && steps.detect.outputs.jars == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jars"
+          git ls-files '*.jar' | while read -r jar; do cp "$jar" "$RUNNER_TEMP/jars/$(echo "$jar" | tr '/' '_')"; done
+          trivy() {
+            docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
+              -v "$RUNNER_TEMP/jars:/jars:ro" -v "$TOOLS_DIR/trivy-cache:/cache:ro" \
+              -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
+              "$TRIVY_IMAGE" rootfs /jars --cache-dir /cache --skip-db-update --offline-scan --no-progress "$@"
+          }
+          trivy --quiet --format cyclonedx --output /reports/sbom-jars.cdx.json
+          rc=0
+          trivy --ignorefile /trivyignore.yaml --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --format table --output /reports/trivy-jars.txt || rc=$?
+          "$TOOLS_DIR/trivy-report.sh" JAR "$REPORT_DIR/trivy-jars.txt" || exit 1
+          exit $rc
+
+      - name: 'npm dependencies: SBOM + Trivy'
+        if: ${{ !cancelled() && steps.detect.outputs.npm == 'true' }}
+        run: |
+          set -euo pipefail
+          lock="$RUNNER_TEMP/lock"
+          mkdir -p "$lock"
+          cp package.json "$lock/"
+          if [ -f package-lock.json ]; then cp package-lock.json "$lock/"; fi
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$lock:/app" -w /app "$NODE_IMAGE" \
+            npm install --package-lock-only --ignore-scripts --no-audit --no-fund --loglevel=error
+          trivy() {
+            docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
+              -v "$lock:/lock:ro" -v "$TOOLS_DIR/trivy-cache:/cache:ro" \
+              -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
+              "$TRIVY_IMAGE" fs /lock --cache-dir /cache --skip-db-update --offline-scan --no-progress "$@"
+          }
+          trivy --quiet --format cyclonedx --output /reports/sbom-npm.cdx.json
+          rc=0
+          trivy --ignorefile /trivyignore.yaml --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --format table --output /reports/trivy-npm.txt || rc=$?
+          "$TOOLS_DIR/trivy-report.sh" npm "$REPORT_DIR/trivy-npm.txt" || exit 1
+          exit $rc
+
+      - name: 'CDN libraries: SBOM + Trivy'
+        if: ${{ !cancelled() && steps.detect.outputs.cdn == 'true' }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cdn_sbom.py" <<'PY'
+          import json, pathlib, re
+          pattern = re.compile(r"https://(?:unpkg\.com|cdn\.jsdelivr\.net/npm)/((?:@[\w.-]+/)?[\w.-]+)@(\d[\w.+-]*)")
+          found = {}
+          for path in pathlib.Path("/src").rglob("*"):
+              if path.suffix not in (".html", ".vue", ".js", ".ts", ".mjs") or "node_modules" in path.parts or ".git" in path.parts:
+                  continue
+              for name, version in pattern.findall(path.read_text(errors="ignore")):
+                  found.setdefault((name, version), set()).add(str(path.relative_to("/src")))
+
+          def purl(name, version):
+              return f"pkg:npm/{name.replace('@', '%40', 1) if name.startswith('@') else name}@{version}"
+
+          components = [{"type": "library", "bom-ref": purl(n, v), "name": n, "version": v, "purl": purl(n, v)} for n, v in sorted(found)]
+          bom = {"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+                 "metadata": {"component": {"type": "application", "name": "cdn", "bom-ref": "cdn"}},
+                 "components": components}
+          json.dump(bom, open("/reports/sbom-cdn.cdx.json", "w"), indent=2)
+          for (n, v), paths in sorted(found.items()):
+              print(f"{n}@{v}: {', '.join(sorted(paths))}")
+          PY
+          docker run --rm --network none -u "$(id -u):$(id -g)" \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP/cdn_sbom.py:/cdn_sbom.py:ro" -v "$REPORT_DIR:/reports" \
+            "$PYTHON_IMAGE" python -I /cdn_sbom.py
+          rc=0
+          docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$TOOLS_DIR/trivy-cache:/cache:ro" -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
+            "$TRIVY_IMAGE" sbom /reports/sbom-cdn.cdx.json \
+              --cache-dir /cache --skip-db-update --offline-scan --ignorefile /trivyignore.yaml \
+              --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --no-progress \
+              --exit-code 1 --format table --output /reports/trivy-cdn.txt || rc=$?
+          "$TOOLS_DIR/trivy-report.sh" CDN "$REPORT_DIR/trivy-cdn.txt" || exit 1
+          exit $rc
+
+      - name: 'SBOM: new advisories + malicious packages (OSV)'
+        if: ${{ !cancelled() && (steps.detect.outputs.maven == 'true' || steps.detect.outputs.npm == 'true' || steps.detect.outputs.jars == 'true' || steps.detect.outputs.cdn == 'true') }}
+        env:
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/osv_sbom.py" <<'PY'
+          import glob, json, os, re, sys, time, urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          since = datetime.now(timezone.utc) - timedelta(hours=int(os.environ["LOOKBACK_HOURS"]))
+          purls = set()
+          for path in glob.glob("/reports/sbom-*.cdx.json"):
+              for component in json.load(open(path)).get("components", []):
+                  purl = component.get("purl", "")
+                  if purl.startswith(("pkg:maven/", "pkg:npm/")) and "@" in purl:
+                      purls.add(purl.split("?")[0])
+          purls = sorted(purls)
+          if not purls:
+              print("::error::SBOM is empty or missing")
+              sys.exit(1)
+
+          def request(url, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": "vuln-watch"})
+              for attempt in range(4):
+                  try:
+                      with urllib.request.urlopen(req, timeout=120) as resp:
+                          return json.load(resp)
+                  except Exception as ex:
+                      if attempt == 3:
+                          raise
+                      print(f"  retry OSV: {ex}")
+                      time.sleep(15 * (attempt + 1))
+
+          def parse(stamp):
+              return datetime.fromisoformat(stamp.replace("Z", "+00:00")) if stamp else None
+
+          affected = {}
+          for start in range(0, len(purls), 500):
+              chunk = purls[start:start + 500]
+              results = request("https://api.osv.dev/v1/querybatch", {"queries": [{"package": {"purl": p}} for p in chunk]})["results"]
+              for purl, result in zip(chunk, results):
+                  for vuln in result.get("vulns", []):
+                      affected.setdefault(vuln["id"], {"purls": set(), "modified": vuln.get("modified", "")})["purls"].add(purl)
+
+          accepted = set()
+          if os.path.exists("/trivyignore.yaml"):
+              today = datetime.now(timezone.utc).date().isoformat()
+              entries, entry_id = {}, None
+              for line in open("/trivyignore.yaml"):
+                  found = re.match(r"\s*-\s*id:\s*['\"]?([\w.-]+)", line)
+                  if found:
+                      entry_id = found.group(1)
+                      entries.setdefault(entry_id, None)
+                      continue
+                  found = re.match(r"\s*expired_at:\s*['\"]?(\d{4}-\d{2}-\d{2})", line)
+                  if found and entry_id:
+                      entries[entry_id] = found.group(1)
+              accepted = {key for key, expiry in entries.items() if expiry is None or expiry >= today}
+
+          hits = []
+          for vuln_id, info in sorted(affected.items()):
+              malicious = vuln_id.startswith("MAL-")
+              if not malicious and (parse(info["modified"]) or since) < since:
+                  continue
+              detail = request(f"https://api.osv.dev/v1/vulns/{vuln_id}")
+              if detail.get("withdrawn"):
+                  continue
+              published = parse(detail.get("published"))
+              severity = (detail.get("database_specific") or {}).get("severity", "").upper()
+              is_new = published is not None and published >= since and severity not in ("LOW", "MODERATE", "MEDIUM")
+              aliases = [a for a in detail.get("aliases", []) if a.startswith("CVE-")]
+              if is_new and not malicious and accepted & {vuln_id, *aliases}:
+                  print(f"Accepted in .trivyignore.yaml: {vuln_id} ({', '.join(aliases)})")
+                  continue
+              if malicious or is_new:
+                  hits.append({"id": vuln_id, "malicious": malicious, "severity": severity or "unknown",
+                               "published": detail.get("published"),
+                               "aliases": aliases,
+                               "summary": (detail.get("summary") or detail.get("details", ""))[:200],
+                               "packages": sorted(info["purls"])})
+
+          with open("/reports/osv-sbom.json", "w") as out:
+              json.dump({"checked": len(purls), "known_vulns": len(affected), "hits": hits}, out, indent=2)
+
+          print(f"SBOM: {len(purls)} packages | known vulnerabilities in used versions: {len(affected)} (see Trivy steps)")
+          if not hits:
+              print("No new HIGH/CRITICAL advisory and no malicious package.")
+              sys.exit(0)
+          for hit in hits:
+              kind = "MALICIOUS PACKAGE" if hit["malicious"] else f"NEW {hit['severity']} ADVISORY"
+              names = ", ".join(p.removeprefix("pkg:") for p in hit["packages"][:5])
+              cves = f" ({', '.join(hit['aliases'])})" if hit["aliases"] else ""
+              summary = " ".join(hit["summary"].split())
+              print(f"::error title={kind} {hit['id']}::{hit['id']}{cves} in {names}: {summary}")
+              print(f"    https://osv.dev/vulnerability/{hit['id']}")
+          sys.exit(1)
+          PY
+          docker run --rm -u "$(id -u):$(id -g)" -e LOOKBACK_HOURS \
+            -v "$RUNNER_TEMP/osv_sbom.py:/osv_sbom.py:ro" -v "$REPORT_DIR:/reports" \
+            -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
+            "$PYTHON_IMAGE" python -I /osv_sbom.py
+
+      - name: 'Docker images: Trivy'
+        if: ${{ !cancelled() && steps.detect.outputs.images != '' }}
+        env:
+          IMAGES: ${{ steps.detect.outputs.images }}
+        run: |
+          set -euo pipefail
+          rc=0
+          for img in $IMAGES; do
+            echo "=== $img"
+            safe=$(echo "$img" | tr '/:@' '___')
+            docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+              -v "$TOOLS_DIR/trivy-cache:/cache" -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
+              "$TRIVY_IMAGE" image "$img" --image-src remote \
+                --cache-dir /cache --skip-db-update --ignorefile /trivyignore.yaml \
+                --skip-files usr/local/bin/gosu \
+                --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --no-progress \
+                --exit-code 1 --format table --output "/reports/trivy-image-$safe.txt" || rc=$?
+            "$TOOLS_DIR/trivy-report.sh" "$img" "$REPORT_DIR/trivy-image-$safe.txt" || rc=1
+          done
+          exit $rc
+
+      - name: 'SAST: Semgrep'
+        if: ${{ !cancelled() && (steps.detect.outputs.java == 'true' || steps.detect.outputs.js == 'true') }}
+        run: |
+          set -euo pipefail
+          configs=""
+          for d in "$RUNNER_TEMP"/semgrep-rules/*/; do configs="$configs --config /rules/$(basename "$d")"; done
+          rc=0
+          docker run --rm --network none -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e SEMGREP_ENABLE_VERSION_CHECK=0 -e SEMGREP_SEND_METRICS=off \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP/semgrep-rules:/rules:ro" -v "$REPORT_DIR:/reports" -w /src \
+            "$SEMGREP_IMAGE" \
+            semgrep scan --metrics=off --disable-version-check --quiet $configs \
+              --exclude target --exclude node_modules --exclude .nuxt --exclude .output --exclude dist \
+              --exclude 'src/test' --exclude '*.min.js' \
+              --severity WARNING --severity ERROR --error \
+              --sarif-output=/reports/semgrep.sarif --text-output=/reports/semgrep.txt \
+              > /dev/null || rc=$?
+          echo "Semgrep findings: $(grep -o '"ruleId"' "$REPORT_DIR/semgrep.sarif" | wc -l)"
+          cat "$REPORT_DIR/semgrep.txt"
+          exit $rc
+
+      - name: 'Configuration checks'
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          errors=0
+          err() { echo "::error::$1"; errors=$((errors + 1)); }
+          warn() { echo "::warning::$1"; }
+          files=$(git ls-files)
+          compose=$(echo "$files" | grep -E '(^|/)(docker-compose[^/]*|compose)\.ya?ml$' | tr '\n' ' ')
+          dockerfiles=$(echo "$files" | grep -E '(^|/)Dockerfile[^/]*$' | tr '\n' ' ')
+          poms=$(echo "$files" | grep -E '(^|/)pom\.xml$' | tr '\n' ' ')
+
+          if [ -n "$compose" ]; then
+            grep -nH 'docker\.sock' $compose && err "docker.sock mounted into a container = root on the host"
+            grep -nHE '^\s*privileged:\s*true' $compose && err "privileged container"
+            grep -nHE '^\s*(network_mode|pid|ipc):\s*["'"'"']?host' $compose && err "container shares a host namespace"
+            grep -nHE '^\s*-\s*["'"'"']?/(:|etc|root|proc|sys|var/run)[:/]' $compose && err "sensitive host directory mounted"
+          fi
+          if [ -n "$dockerfiles" ]; then
+            grep -nHiE '^[[:space:]]*FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]]+)?[^[:space:]:@$]+(:latest)?([[:space:]]|$)' $dockerfiles | grep -viE 'FROM\s+scratch' && warn "base image without a pinned version (latest or no tag)"
+            grep -nHiE '(curl|wget)[^|]*\|\s*(ba)?sh' $dockerfiles && err "piping a downloaded script into a shell"
+            grep -nHiE '(curl|wget)\s.*/releases/latest/download/' $dockerfiles && warn "downloading the latest release binary without a pinned version or checksum"
+          fi
+          if [ -n "$poms" ]; then
+            grep -nHE '<url>\s*http://' $poms && err "Maven repository over plain http (dependencies can be replaced in transit)"
+            grep -nHE 'jcenter\.bintray\.com' $poms && warn "JCenter (jcenter.bintray.com) is shut down - remove the repository"
+          fi
+          echo "$files" | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -vE '\.(example|sample|template|dist)$' \
+            | while read -r f; do echo "::error::committed environment file $f"; done | grep . && errors=$((errors + 1))
+
+          echo "Errors: $errors"
+          [ "$errors" -eq 0 ]
+
+      - name: Upload reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vuln-watch-reports
+          path: ${{ runner.temp }}/reports
+          retention-days: 14
+          if-no-files-found: ignore
