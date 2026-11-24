@@ -146,6 +146,9 @@ jobs:
           docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
             -v "$TOOLS_DIR/trivy-cache:/cache" "$TRIVY_IMAGE" \
             image --cache-dir /cache --download-db-only --no-progress
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$TOOLS_DIR/trivy-cache:/cache" "$TRIVY_IMAGE" \
+            image --cache-dir /cache --download-java-db-only --no-progress
           if [ "$NEEDS_JAVA" = true ] || [ "$NEEDS_JS" = true ]; then
             git clone -q --depth 1 "$SEMGREP_RULES_REPO" "$RUNNER_TEMP/semgrep-rules-all"
             mkdir -p "$RUNNER_TEMP/semgrep-rules"
@@ -291,7 +294,7 @@ jobs:
             docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
               -v "$RUNNER_TEMP/deps:/deps:ro" -v "$TOOLS_DIR/trivy-cache:/cache:ro" \
               -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
-              "$TRIVY_IMAGE" rootfs /deps --cache-dir /cache --skip-db-update --offline-scan --no-progress "$@"
+              "$TRIVY_IMAGE" rootfs /deps --cache-dir /cache --skip-db-update --skip-java-db-update --offline-scan --no-progress "$@"
           }
           trivy --quiet --format cyclonedx --output /reports/sbom-maven.cdx.json
           rc=0
@@ -310,7 +313,7 @@ jobs:
             docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
               -v "$RUNNER_TEMP/jars:/jars:ro" -v "$TOOLS_DIR/trivy-cache:/cache:ro" \
               -v "$REPORT_DIR:/reports" -v "$IGNORE_FILE:/trivyignore.yaml:ro" \
-              "$TRIVY_IMAGE" rootfs /jars --cache-dir /cache --skip-db-update --offline-scan --no-progress "$@"
+              "$TRIVY_IMAGE" rootfs /jars --cache-dir /cache --skip-db-update --skip-java-db-update --offline-scan --no-progress "$@"
           }
           trivy --quiet --format cyclonedx --output /reports/sbom-jars.cdx.json
           rc=0
@@ -529,7 +532,7 @@ jobs:
       - name: 'Configuration checks'
         if: ${{ !cancelled() }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           errors=0
           err() { echo "::error::$1"; errors=$((errors + 1)); }
           warn() { echo "::warning::$1"; }
