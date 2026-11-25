@@ -198,11 +198,20 @@ jobs:
           lead = re.compile(r"^\s*(?:Description:\s*)?(?:In\s+)?(?P<product>(?:[^.:\n]|\.(?=\S)){1,120}?)\s"
                             r"(?:before|prior to|versions?|through|is an?|contains|allows|has)\b", re.I)
 
-          def other_product(description, word):
-              found = lead.match(description)
+          def relevant(cve, description, word):
+              flat = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+              for config in cve.get("configurations", []):
+                  for node in config.get("nodes", []):
+                      if any(flat(word) in flat(m.get("criteria", "")) for m in node.get("cpeMatch", [])):
+                          return True
               if re.search(r"WordPress (?:plugin|theme)", description, re.I):
-                  return True
-              return bool(found) and not matching(found.group("product"), [word])
+                  return False
+              if re.match(r"\s*(?:The\s+)?\S+\s+(?:npm|PyPI|RubyGems|Packagist|Composer)\s+package\b", description, re.I) and not matching(description[:60], [word]):
+                  return False
+              if not matching(description[:120], [word]):
+                  return False
+              found = lead.match(description)
+              return not (found and not matching(found.group("product"), [word]))
 
           def score(cve):
               scores = []
@@ -233,7 +242,7 @@ jobs:
                   description = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "")
                   found = matching(description, [word])
                   cvss = score(cve)
-                  if not found or other_product(description, word) or (cvss is not None and cvss < min_cvss):
+                  if not found or not relevant(cve, description, word) or (cvss is not None and cvss < min_cvss):
                       continue
                   entry = hits.setdefault(cve["id"], {"source": "NVD", "score": cvss, "keywords": [], "summary": description[:300]})
                   entry["keywords"] = sorted(set(entry["keywords"] + found))
